@@ -14,79 +14,81 @@ require 'minitest/hooks/default'
 
 ActiveRecord::Base.establish_connection :adapter => 'sqlite3', :database => ':memory:'
 
-class Player < ActiveRecord::Base
-  has_many :statistics
+class Client < ActiveRecord::Base
+  has_one :address
+  has_many :orders
 
   connection.create_table table_name, :force => true do |t|
     t.string :name
+    t.integer :orders_count
   end
 end
 
-class Statistic < ActiveRecord::Base
-  belongs_to :player
-  belongs_to :participant
+class Address < ActiveRecord::Base
+  belongs_to :client
 
   connection.create_table table_name, :force => true do |t|
-    t.integer :player_id
-    t.integer :participant_id
-    t.integer :points
-    t.integer :time_played
+    t.integer :client_id
+    t.string :street
+    t.string :state
   end
 end
 
-class Participant < ActiveRecord::Base
-  has_one :statistic
-
-  scope :home_games, -> { where(homeaway: 'H') }
-  scope :away_games, -> { where(homeaway: 'A') }
+class Order < ActiveRecord::Base
+  belongs_to :client
 
   connection.create_table table_name, :force => true do |t|
-    t.string :homeaway
+    t.integer :client_id
+    t.decimal :amount
+    t.string :status
   end
 end
 
 describe 'controlling AND OR precedence' do
   before :all do
-    [Statistic, Participant, Player].each { |ar| ar.delete_all }
+    [Client, Address, Order].each { |ar| ar.delete_all }
 
     ActiveRecord::Base.logger = nil
 
-    p = Player.create!(name: 'Dak Prescott')
+    texas = Client.create!(name: "Texas Person")
+    maine = Client.create!(name: "Maine Person")
 
-    Statistic.create!(points: 36, time_played: 60, player: p, participant: Participant.create!(homeaway: 'H'))
-    Statistic.create!(points: 18, time_played: 60, player: p, participant: Participant.create!(homeaway: 'H'))
-    Statistic.create!(points: 24, time_played: 60, player: p, participant: Participant.create!(homeaway: 'H'))
+    Address.create!(street: "123 Street Ave.", state: "TX", client: texas)
+    Address.create!(street: "456 Main Street", state: "ME", client: maine)
+
+    Order.create!(client: texas, status: "paid", amount: 30.00)
+    Order.create!(client: texas, status: "pending", amount: 46.00)
+    Order.create!(client: maine, status: "refunded", amount: 30.00)
+    Order.create!(client: maine, status: "pending", amount: 120.00)
 
     ActiveRecord::Base.logger = Logger.new(STDERR)
   end
 
   it 'sql' do
     sql = <<-_
-      SELECT name, points
-      FROM players p INNER JOIN statistics s 
-        ON p.id = s.player_id INNER JOIN participants pa
-        ON s.participant_id = pa.id
-      WHERE pa.homeaway="H" AND (s.points < 20 OR s.points > 30)    
-      ORDER BY s.points
+      SELECT c.name, o.amount
+      FROM clients c INNER JOIN addresses a
+        ON c.id = a.client_id INNER JOIN orders o
+        ON c.id = o.client_id
+      WHERE a.state="TX" AND (o.amount < 40 OR o.amount > 100)    
+      ORDER BY o.id
     _
-    result = Player.connection.execute(sql)
-    result.length.must_equal 2
-    assert_row(result.first, {name: 'Dak Prescott', points: 18})
-    assert_row(result.last, {name: 'Dak Prescott', points: 36})
+    result = Client.connection.execute(sql)
+    result.length.must_equal 1
+    assert_row(result.first, {name: 'Texas Person', amount: 30})
   end
 
   # AND is higher precedence than OR, so use `merge` to ensure a higher precedent
   # OR gets processed first.
   it 'ar and scopes' do
-    base = Player.select("name, points").joins(statistics: [:participant])
-    result = base.merge(Participant.home_games)
-               .merge(base.where("statistics.points < ?", 20)
-                        .or(base.where("statistics.points > ?", 30)))
-               .order("statistics.points")
+    base = Client.select("name, amount").joins(:address, :orders)
+    result = base.merge(Address.where(state: "TX"))
+               .merge(base.where("orders.amount < ?", 40)
+                        .or(base.where("orders.amount > ?", 100)))
+               .order("orders.id")
 
-    result.length.must_equal 2
-    assert_row(result.first, {name: 'Dak Prescott', points: 18})
-    assert_row(result.last, {name: 'Dak Prescott', points: 36})
+    result.length.must_equal 1
+    assert_row(result.first, {name: 'Texas Person', amount: 30})
   end
 
   def assert_row(row, values)
