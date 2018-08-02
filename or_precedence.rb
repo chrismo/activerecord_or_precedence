@@ -6,6 +6,7 @@ gemfile do
   gem 'activerecord', '~> 5.0.0', '< 5.1.0'
   gem 'sqlite3'
   gem 'minitest-hooks'
+  gem 'tablesmith'
 end
 
 require 'active_record'
@@ -64,31 +65,78 @@ describe 'controlling AND OR precedence' do
     ActiveRecord::Base.logger = Logger.new(STDERR)
   end
 
-  it 'sql' do
-    sql = <<-_
-      SELECT c.name, o.amount
-      FROM clients c INNER JOIN addresses a
-        ON c.id = a.client_id INNER JOIN orders o
-        ON c.id = o.client_id
-      WHERE a.state="TX" AND (o.amount < 40 OR o.amount > 100)    
+  it "dump table" do
+    sql = <<~_
+      SELECT c.name, a.state, o.id as order_id, o.amount
+      FROM clients c
+             INNER JOIN addresses a ON c.id = a.client_id
+             INNER JOIN orders o ON c.id = o.client_id
       ORDER BY o.id
     _
     result = Client.connection.execute(sql)
-    result.length.must_equal 1
-    assert_row(result.first, {name: 'Texas Person', amount: 30})
+    p result.to_a.to_table
   end
 
-  # AND is higher precedence than OR, so use `merge` to ensure a higher precedent
-  # OR gets processed first.
-  it 'ar and scopes' do
-    base = Client.select("name, amount").joins(:address, :orders)
-    result = base.merge(Address.where(state: "TX"))
-               .merge(base.where("orders.amount < ?", 40)
-                        .or(base.where("orders.amount > ?", 100)))
-               .order("orders.id")
+  describe "AND has naturally higher precedence" do
+    it "sql" do
+      sql = <<~_
+        SELECT c.name, o.amount
+        FROM clients c
+               INNER JOIN addresses a ON c.id = a.client_id
+               INNER JOIN orders o ON c.id = o.client_id
+        WHERE a.state = "TX" AND o.amount < 40
+           OR a.state = "ME" AND o.amount > 100
+        ORDER BY o.id
+      _
+      result = Client.connection.execute(sql)
+      result.length.must_equal 2
+      assert_row(result.first, {name: 'Texas Person', amount: 30})
+      assert_row(result.last, {name: 'Maine Person', amount: 120})
+    end
 
-    result.length.must_equal 1
-    assert_row(result.first, {name: 'Texas Person', amount: 30})
+    it "ar" do
+      base = Client.select("name, amount").joins(:address, :orders)
+      result = base.where(addresses: {state: "TX"})
+                 .where("orders.amount < ?", 40)
+                 .or(
+                   base.where(addresses: {state: "ME"})
+                     .where("orders.amount > ?", 100)
+                 )
+                 .order("orders.id")
+
+      result.length.must_equal 2
+      assert_row(result.first, {name: 'Texas Person', amount: 30})
+      assert_row(result.last, {name: 'Maine Person', amount: 120})
+    end
+  end
+
+  describe "Enforce higher OR precedence" do
+    it "sql" do
+      sql = <<~_
+        SELECT c.name, o.amount
+        FROM clients c
+               INNER JOIN addresses a ON c.id = a.client_id
+               INNER JOIN orders o ON c.id = o.client_id
+        WHERE a.state = "TX"
+          AND (o.amount < 40 OR o.amount > 100)
+        ORDER BY o.id
+      _
+      result = Client.connection.execute(sql)
+      result.length.must_equal 1
+      assert_row(result.first, {name: 'Texas Person', amount: 30})
+    end
+
+    # AND is higher precedence than OR, so use `merge` to ensure a higher precedent
+    # OR gets processed first.
+    it "ar" do
+      base = Client.select("name, amount").joins(:address, :orders)
+      amounts = base.where("orders.amount < ?", 40).or(base.where("orders.amount > ?", 100))
+      texas_addresses = Address.where(state: "TX")
+      result = base.merge(texas_addresses).merge(amounts).order("orders.id")
+
+      result.length.must_equal 1
+      assert_row(result.first, {name: 'Texas Person', amount: 30})
+    end
   end
 
   def assert_row(row, values)
